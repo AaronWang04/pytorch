@@ -584,6 +584,19 @@ bool check_dtypes_low_precision(sdp_params const& params, bool debug) {
   }
 }
 
+bool check_cudnn_dtypes_low_precision(sdp_params const& params, bool debug) {
+  auto dprop = at::cuda::getCurrentDeviceProperties();
+  if (dprop->major >= 8) {
+    constexpr auto sm80_dtypes =
+        c10::array_of<at::ScalarType>(at::kHalf, at::kBFloat16, at::kFloat8_e5m2);
+    return check_tensor_dtype(params, sm80_dtypes, debug);
+  } else {
+    constexpr auto default_dtypes = c10::array_of<at::ScalarType>(at::kHalf);
+    return check_tensor_dtype(params, default_dtypes, debug);
+  }
+}
+
+
 bool check_runtime_disabled_cudnn(sdp_params const& params, bool debug) {
   // We check the global context to see if user has explicitly turned of cudnn
   // sdp kernels
@@ -635,7 +648,7 @@ bool can_use_cudnn_attention(const sdp_params& params, bool debug) {
           check_tensor_shapes,
           check_cudnn_tensor_shapes,
           check_cudnn_deterministic,
-          check_dtypes_low_precision,
+          check_cudnn_dtypes_low_precision,
           check_attn_mask_shape,
           check_cudnn_hardware_support
           );
