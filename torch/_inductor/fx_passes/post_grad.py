@@ -590,6 +590,18 @@ def lazy_init():
         extra_check=prepare_softmax_extra_check,
     )
 
+    inp = functools.partial(torch.empty, (5,), device="cuda")
+    mat1 = functools.partial(torch.empty, (3, 4), device="cuda")
+    mat2 = functools.partial(torch.empty, (4, 5), device="cuda")
+    register_replacement(
+        addmm_gelu_pattern,
+        addmm_gelu_replacement,
+        [inp(), mat1(), mat2()],
+        fwd_only,
+        pass_patterns[1],
+        extra_check=is_valid_addmm_activation_fusion_gelu,
+    )
+
 
 def reorder_for_locality(graph: torch.fx.Graph):
     if torch.distributed.is_available():
@@ -1389,16 +1401,16 @@ def should_prefer_unfused_addmm(match):
     return all(is_pointwise_use(use) for use in output.users)
 
 
-@register_graph_pattern(
-    CallFunction(aten.addmm, KeywordArg("inp"), Arg(), Arg()),
-    pass_dict=pass_patterns[2],
-    extra_check=should_prefer_unfused_addmm,
-)
-def unfuse_bias_add_to_pointwise(match: Match, mat1, mat2, *, inp):
-    def repl(inp, x1, x2):
-        return x1 @ x2 + inp
+# @register_graph_pattern(
+#     CallFunction(aten.addmm, KeywordArg("inp"), Arg(), Arg()),
+#     pass_dict=pass_patterns[2],
+#     extra_check=should_prefer_unfused_addmm,
+# )
+# def unfuse_bias_add_to_pointwise(match: Match, mat1, mat2, *, inp):
+#     def repl(inp, x1, x2):
+#         return x1 @ x2 + inp
 
-    match.replace_by_example(repl, [inp, mat1, mat2])
+#     match.replace_by_example(repl, [inp, mat1, mat2])
 
 
 def is_valid_addmm_fusion(match):
@@ -1443,6 +1455,65 @@ def addmm(match, mat1, mat2, *, inp):
 
     match.replace_by_example(repl, [inp, mat1, mat2])
 
+
+def addmm_gelu_pattern(input, mat1, mat2):
+    a = aten.addmm(input, mat1, mat2)
+    M_SQRT2 = 1.41421356237309504880
+    M_2_SQRTPI = 1.12837916709551257390
+    kBeta = M_SQRT2 * M_2_SQRTPI * 0.5
+    kKappa = 0.044715
+    a_cube = a * a * a
+    inner = kBeta * (a + kKappa * a_cube)
+    return 0.5 * a * (1 + torch.tanh(inner))
+
+def addmm_gelu_replacement(input, mat1, mat2):
+    return aten._addmm_activation(input, mat1, mat2, use_gelu=True)
+
+def is_valid_addmm_activation_fusion(match):
+
+    print("match")
+    print(match.args)
+    print(match.kwargs)
+
+    addmm_node = match.args[0]  # The addmm node is the first argument to relu    
+
+    if not is_gpu(addmm_node.meta["val"].device.type):
+        return False
+    
+    if not isinstance(addmm_node.meta["val"], torch.Tensor):
+        return False
+    
+    return True
+
+def is_valid_addmm_activation_fusion_gelu(match):
+
+    addmm_node = match.kwargs["input"]  # The addmm node is the first argument to gelu
+
+    if not is_gpu(addmm_node.meta["val"].device.type):
+        return False
+    
+    if not isinstance(addmm_node.meta["val"], torch.Tensor):
+        return False
+    
+    return True
+
+@register_graph_pattern(
+    CallFunction(
+        aten.relu,
+        CallFunction(
+            aten.addmm,
+            Arg(), Arg(), Arg(),
+            _users=MULTIPLE,
+        ),
+    ),
+    pass_dict=pass_patterns[0],  # Run in the first pass, before unfusing
+    extra_check=is_valid_addmm_activation_fusion,
+)
+def addmm_relu(match, inp, mat1, mat2):
+    def repl(inp, mat1, mat2):
+        # Use default values for beta=1, alpha=1
+        return aten._addmm_activation(inp, mat1, mat2, beta=1, alpha=1, use_gelu=False)
+    match.replace_by_example(repl, [inp, mat1, mat2])
 
 def register_partial_reduction_pattern():
     "Reuse partial reductions in complete reductions"

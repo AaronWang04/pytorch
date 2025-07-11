@@ -1233,8 +1233,12 @@ class _InProcessFxCompile(FxCompile):
             with V.set_fake_mode(fake_mode):
                 # has some issues with memory in training
                 cuda_context = get_cuda_device_context(gm)
+                print("given graph")
+                print(gm.graph)
                 with cuda_context:
                     _recursive_post_grad_passes(gm, is_inference=is_inference)
+                print(gm.graph)
+                
                 V.debug.fx_graph_transformed(gm, example_inputs)
                 post_grad_graphs_log.debug(
                     "%s",
@@ -2126,7 +2130,6 @@ def compile_fx(
                 ),
             )
             torch._inductor.debug._pre_grad_graph_id = id(model_.graph)
-
             model_ = _recursive_pre_grad_passes(model_, example_inputs_)
             trace_structured(
                 "artifact",
@@ -2168,7 +2171,6 @@ def compile_fx(
         # uniquely identify multiple Inductor compilations that arise from
         # DDPOptimizer
         graph_id = next(_graph_counter)
-
         decompositions = (
             decompositions if decompositions is not None else select_decomp_table()
         )

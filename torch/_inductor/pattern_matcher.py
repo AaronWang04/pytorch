@@ -1542,6 +1542,7 @@ def register_replacement(
                 scalar_workaround,
                 exclusive_arg_names,
             )
+
         else:
             pattern = search_fn_pattern
             gm = None
