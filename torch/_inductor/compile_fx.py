@@ -1233,11 +1233,9 @@ class _InProcessFxCompile(FxCompile):
             with V.set_fake_mode(fake_mode):
                 # has some issues with memory in training
                 cuda_context = get_cuda_device_context(gm)
-                print("given graph")
                 print(gm.graph)
                 with cuda_context:
                     _recursive_post_grad_passes(gm, is_inference=is_inference)
-                print(gm.graph)
                 
                 V.debug.fx_graph_transformed(gm, example_inputs)
                 post_grad_graphs_log.debug(

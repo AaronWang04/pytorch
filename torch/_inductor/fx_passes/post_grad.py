@@ -590,9 +590,22 @@ def lazy_init():
         extra_check=prepare_softmax_extra_check,
     )
 
-    inp = functools.partial(torch.empty, (5,), device="cuda")
-    mat1 = functools.partial(torch.empty, (3, 4), device="cuda")
-    mat2 = functools.partial(torch.empty, (4, 5), device="cuda")
+    # inp = functools.partial(torch.empty, (5,), device="cuda")
+    # mat1 = functools.partial(torch.empty, (3, 4), device="cuda")
+    # mat2 = functools.partial(torch.empty, (4, 5), device="cuda")
+    # register_replacement(
+    #     addmm_gelu_pattern,
+    #     addmm_gelu_replacement,
+    #     [inp(), mat1(), mat2()],
+    #     fwd_only,
+    #     pass_patterns[1],
+    #     extra_check=is_valid_addmm_activation_fusion_gelu,
+    # )
+
+    dtype = torch.bfloat16
+    inp = functools.partial(torch.empty, (5,), dtype=dtype, device="cuda")
+    mat1 = functools.partial(torch.empty, (3, 4), dtype=dtype, device="cuda")
+    mat2 = functools.partial(torch.empty, (4, 5), dtype=dtype, device="cuda")
     register_replacement(
         addmm_gelu_pattern,
         addmm_gelu_replacement,
@@ -1457,10 +1470,9 @@ def addmm(match, mat1, mat2, *, inp):
 
 
 def addmm_gelu_pattern(input, mat1, mat2):
-    a = aten.addmm(input, mat1, mat2)
-    M_SQRT2 = 1.41421356237309504880
-    M_2_SQRTPI = 1.12837916709551257390
-    kBeta = M_SQRT2 * M_2_SQRTPI * 0.5
+    a_ = aten.addmm(input, mat1, mat2)
+    a = prims.convert_element_type(a_, torch.float32)
+    kBeta = 0.7978845608028654
     kKappa = 0.044715
     a_cube = a * a * a
     inner = kBeta * (a + kKappa * a_cube)
@@ -1470,11 +1482,6 @@ def addmm_gelu_replacement(input, mat1, mat2):
     return aten._addmm_activation(input, mat1, mat2, use_gelu=True)
 
 def is_valid_addmm_activation_fusion(match):
-
-    print("match")
-    print(match.args)
-    print(match.kwargs)
-
     addmm_node = match.args[0]  # The addmm node is the first argument to relu    
 
     if not is_gpu(addmm_node.meta["val"].device.type):
@@ -1486,7 +1493,6 @@ def is_valid_addmm_activation_fusion(match):
     return True
 
 def is_valid_addmm_activation_fusion_gelu(match):
-
     addmm_node = match.kwargs["input"]  # The addmm node is the first argument to gelu
 
     if not is_gpu(addmm_node.meta["val"].device.type):
