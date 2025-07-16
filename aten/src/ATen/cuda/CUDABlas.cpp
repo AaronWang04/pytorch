@@ -671,7 +671,7 @@ inline void bgemm_internal_cublas_half_helper(CUDABLAS_BGEMM_ARGTYPES_AND_C_DTYP
       alpha_ptr, a, CUDA_R_16F, lda, stridea,
       b, CUDA_R_16F, ldb, strideb, beta_ptr,
       c, std::is_same_v<C_Dtype, float> ? CUDA_R_32F : CUDA_R_16F, ldc, stridec,
-      num_batches, compute_type, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      num_batches, compute_type, CUBLAS_GEMM_AUTOTUNE));
   } else {
     for (const auto i : c10::irange(num_batches)) {
       if (std::is_same_v<C_Dtype, float>) {
@@ -719,7 +719,7 @@ inline void bgemm_internal_cublas_bfloat16_helper(CUDABLAS_BGEMM_ARGTYPES_AND_C_
                               (void*)&fbeta, c, std::is_same_v<C_Dtype, float> ? CUDA_R_32F : CUDA_R_16BF,
                               (int)ldc, stridec, (int)num_batches,
                               compute_type,
-                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                              CUBLAS_GEMM_AUTOTUNE));
 }
 
 template <>
@@ -1164,7 +1164,7 @@ inline void gemm_internal_cublas_half_helper(CUDABLAS_GEMM_ARGTYPES_AND_C_DTYPE(
         std::is_same_v<C_Dtype, float> ? CUDA_R_32F : CUDA_R_16F,
         ldc,
         compute_type,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        CUBLAS_GEMM_AUTOTUNE));
     TORCH_CUDABLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
   } else {
     TORCH_CUDABLAS_CHECK(cublasSgemmEx(
@@ -1230,7 +1230,7 @@ inline void gemm_internal_cublas_bfloat16_helper(CUDABLAS_GEMM_ARGTYPES_AND_C_DT
       std::is_same_v<C_Dtype, float> ? CUDA_R_32F : CUDA_R_16BF,
       ldc,
       compute_type,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+      CUBLAS_GEMM_AUTOTUNE));
   TORCH_CUDABLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
 }
 
