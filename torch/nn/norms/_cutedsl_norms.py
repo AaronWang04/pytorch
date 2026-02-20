@@ -10,7 +10,7 @@ import torch
 from torch.library import Library
 
 from . import _registry
-from ._kernels.norms import (
+from ._kernel_norms import (
     cutedsl_layernorm_bwd,
     cutedsl_layernorm_fwd,
     cutedsl_rmsnorm_bwd,
