@@ -171,6 +171,10 @@ def _cutedsl_fused_rms_norm_impl(
     *,
     fallback_kernel: _RMSNormFwdFallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    error = _support_error(input, _collect_tensors(input, weight), "RMSNorm")
+    if error is not None:
+        return fallback_kernel(dispatch_keys, input, normalized_shape, weight, eps)
+
     n_norm = len(normalized_shape)
     N = normalized_shape[0] if n_norm == 1 else math.prod(normalized_shape)
     M = input.numel() // N
@@ -187,7 +191,7 @@ def _cutedsl_fused_rms_norm_impl(
         _fwd_compile_cache[key] = compiled
 
     if eps is None:
-        eps = 1e-5
+        eps = torch.finfo(input.dtype).eps
 
     out = torch.empty_like(x)
     rstd = torch.empty(M, device=input.device, dtype=torch.float32)
