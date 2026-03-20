@@ -1,4 +1,5 @@
 """CuTeDSL RMSNorm overrides for aten fused RMSNorm operators.
+print("\nTrace exported to 'trace.json'. Open chrome://tracing/ in your browser and load this file.")
 
 Registers flat Python impls directly on the aten::_fused_rms_norm and
 aten::_fused_rms_norm_backward CUDA dispatch keys. The compiled TVM FFI
@@ -68,12 +69,8 @@ def _support_error(
     return None
 
 
-def _stat_shape(input: torch.Tensor, normalized_shape: list[int]) -> list[int]:
-    axis = input.dim() - len(normalized_shape)
-    shape: list[int] = []
-    for i in range(input.dim()):
-        shape.append(input.shape[i] if i < axis else 1)
-    return shape
+def _stat_shape(input: torch.Tensor, n_norm: int) -> tuple[int, ...]:
+    return input.shape[: input.dim() - n_norm] + (1,) * n_norm
 
 
 def _get_compiled_fwd(dtype, weight_dtype, N):
@@ -174,22 +171,35 @@ def _cutedsl_fused_rms_norm_impl(
     *,
     fallback_kernel: _RMSNormFwdFallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    N = math.prod(normalized_shape)
+    n_norm = len(normalized_shape)
+    N = normalized_shape[0] if n_norm == 1 else math.prod(normalized_shape)
     M = input.numel() // N
-    x = input.reshape(M, N)
+    needs_reshape = input.dim() != 2 or input.shape[0] != M
+    x = input.reshape(M, N) if needs_reshape else input
 
-    w = weight.reshape(N) if weight is not None else None
-    key = (x.dtype, w.dtype if w is not None else None, N)
+    w = weight if weight is not None and weight.dim() == 1 else (
+        weight.reshape(N) if weight is not None else None
+    )
+    key = (input.dtype, weight.dtype if weight is not None else None, N)
     compiled = _fwd_compile_cache.get(key)
     if compiled is None:
         compiled = _get_compiled_fwd(*key)
         _fwd_compile_cache[key] = compiled
 
+    if eps is None:
+        eps = 1e-5
+
     out = torch.empty_like(x)
-    rstd = torch.empty(M, device=x.device, dtype=torch.float32)
+    rstd = torch.empty(M, device=input.device, dtype=torch.float32)
     compiled(x, w, None, None, out, None, rstd, eps)
 
-    return out.reshape(input.shape), rstd.view(_stat_shape(input, normalized_shape))
+    if needs_reshape:
+        out = out.reshape(input.shape)
+    if n_norm == 1 and input.dim() == 2:
+        rstd = rstd.unsqueeze(1)
+    else:
+        rstd = rstd.view(_stat_shape(input, n_norm))
+    return out, rstd
 
 
 def _cutedsl_fused_rms_norm_backward_impl(
