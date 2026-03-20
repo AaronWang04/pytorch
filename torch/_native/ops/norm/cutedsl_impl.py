@@ -1,10 +1,18 @@
-"""CuTeDSL RMSNorm overrides for aten fused RMSNorm operators."""
+"""CuTeDSL RMSNorm overrides for aten fused RMSNorm operators.
+
+Registers flat Python impls directly on the aten::_fused_rms_norm and
+aten::_fused_rms_norm_backward CUDA dispatch keys. The compiled TVM FFI
+kernels are called directly from these impls, bypassing the
+@torch.library.custom_op layer to reduce CPU dispatch overhead.
+"""
+
 # mypy: allow-untyped-defs
 
 from __future__ import annotations
 
 import functools
 import logging
+import math
 from collections.abc import Callable
 
 import torch
@@ -38,13 +46,6 @@ def _get_device_major(device: torch.device) -> int:
     return major
 
 
-@functools.cache
-def _get_rmsnorm_kernels():
-    from .norms import cutedsl_rmsnorm_bwd, cutedsl_rmsnorm_fwd
-
-    return cutedsl_rmsnorm_fwd, cutedsl_rmsnorm_bwd
-
-
 def _collect_tensors(*tensors: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
     return tuple(t for t in tensors if t is not None)
 
@@ -67,6 +68,103 @@ def _support_error(
     return None
 
 
+def _stat_shape(input: torch.Tensor, normalized_shape: list[int]) -> list[int]:
+    axis = input.dim() - len(normalized_shape)
+    shape: list[int] = []
+    for i in range(input.dim()):
+        shape.append(input.shape[i] if i < axis else 1)
+    return shape
+
+
+def _get_compiled_fwd(dtype, weight_dtype, N):
+    """JIT-compile and cache the forward RMSNorm kernel for the given config."""
+    from ._rmsnorm_kernels import (
+        _TORCH2CUTE_DTYPE,
+        RMSNorm,
+    )
+    from ._cute_utils import make_fake_tensor as fake_tensor
+
+    import cutlass.cute as cute
+    from cutlass import Float32
+
+    cute_dtype = _TORCH2CUTE_DTYPE[dtype]
+    cute_weight_dtype = _TORCH2CUTE_DTYPE[weight_dtype] if weight_dtype is not None else None
+    div = math.gcd(N, *(
+        128 // dt.width
+        for dt in [cute_dtype, cute_dtype, cute_weight_dtype]
+        if dt is not None
+    ))
+    batch_sym = cute.sym_int()
+    x_cute = fake_tensor(cute_dtype, (batch_sym, N), div)
+    out_cute = fake_tensor(cute_dtype, (batch_sym, N), div)
+    weight_cute = fake_tensor(cute_weight_dtype, (N,), div)
+    rstd_cute = fake_tensor(Float32, (batch_sym,))
+    return cute.compile(
+        RMSNorm(cute_dtype, N),
+        x_cute,
+        weight_cute,
+        None,  # bias
+        None,  # residual
+        out_cute,
+        None,  # residual_out
+        rstd_cute,
+        Float32(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _get_compiled_bwd(dtype, weight_dtype, N):
+    """JIT-compile and cache the backward RMSNorm kernel for the given config."""
+    from ._rmsnorm_kernels import (
+        _TORCH2CUTE_DTYPE,
+        RMSNormBackward,
+    )
+    from ._cute_utils import make_fake_tensor as fake_tensor
+
+    import cutlass.cute as cute
+    from cutlass import Float32
+
+    cute_dtype = _TORCH2CUTE_DTYPE[dtype]
+    cute_weight_dtype = _TORCH2CUTE_DTYPE[weight_dtype] if weight_dtype is not None else None
+    div = math.gcd(N, *(
+        128 // dt.width
+        for dt in [cute_dtype, cute_dtype, cute_dtype]
+        if dt is not None
+    ))
+    batch_sym = cute.sym_int()
+    batch_partial_sym = cute.sym_int()
+    x_cute = fake_tensor(cute_dtype, (batch_sym, N), div)
+    dout_cute = fake_tensor(cute_dtype, (batch_sym, N), div)
+    dx_cute = fake_tensor(cute_dtype, (batch_sym, N), div)
+    weight_cute = fake_tensor(cute_weight_dtype, (N,), div)
+    rstd_cute = fake_tensor(Float32, (batch_sym,))
+    dw_partial_cute = (
+        fake_tensor(Float32, (batch_partial_sym, N), div)
+        if cute_weight_dtype is not None
+        else None
+    )
+    return cute.compile(
+        RMSNormBackward(cute_dtype, N),
+        x_cute,
+        weight_cute,
+        dout_cute,
+        None,  # dresidual_out
+        rstd_cute,
+        dx_cute,
+        dw_partial_cute,
+        None,  # dresidual
+        None,  # db_partial
+        0,  # sm_count (symbolic)
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+_fwd_compile_cache: dict = {}
+_bwd_compile_cache: dict = {}
+
+
 def _cutedsl_fused_rms_norm_impl(
     dispatch_keys: torch.DispatchKeySet,
     input: torch.Tensor,
@@ -76,15 +174,22 @@ def _cutedsl_fused_rms_norm_impl(
     *,
     fallback_kernel: _RMSNormFwdFallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    error = _support_error(input, _collect_tensors(input, weight), "RMSNorm")
-    if error is not None:
-        return fallback_kernel(dispatch_keys, input, normalized_shape, weight, eps)
+    N = math.prod(normalized_shape)
+    M = input.numel() // N
+    x = input.reshape(M, N)
 
-    if eps is None:
-        eps = torch.finfo(input.dtype).eps
+    w = weight.reshape(N) if weight is not None else None
+    key = (x.dtype, w.dtype if w is not None else None, N)
+    compiled = _fwd_compile_cache.get(key)
+    if compiled is None:
+        compiled = _get_compiled_fwd(*key)
+        _fwd_compile_cache[key] = compiled
 
-    cutedsl_rmsnorm_fwd, _ = _get_rmsnorm_kernels()
-    return cutedsl_rmsnorm_fwd(input, weight, normalized_shape, eps)
+    out = torch.empty_like(x)
+    rstd = torch.empty(M, device=x.device, dtype=torch.float32)
+    compiled(x, w, None, None, out, None, rstd, eps)
+
+    return out.reshape(input.shape), rstd.view(_stat_shape(input, normalized_shape))
 
 
 def _cutedsl_fused_rms_norm_backward_impl(
@@ -112,9 +217,34 @@ def _cutedsl_fused_rms_norm_backward_impl(
             output_mask,
         )
 
-    _, cutedsl_rmsnorm_bwd = _get_rmsnorm_kernels()
-    grad_input, grad_weight = cutedsl_rmsnorm_bwd(
-        grad_out, input, rstd, weight, normalized_shape
+    from ._rmsnorm_kernels import _get_sm_count
+
+    N = math.prod(normalized_shape)
+    M = input.numel() // N
+    x = input.reshape(M, N).contiguous()
+    dout = grad_out.reshape(M, N).contiguous()
+    rstd_flat = rstd.reshape(M).contiguous()
+    w = weight.reshape(N) if weight is not None else None
+
+    key = (x.dtype, w.dtype if w is not None else None, N)
+    compiled = _bwd_compile_cache.get(key)
+    if compiled is None:
+        compiled = _get_compiled_bwd(*key)
+        _bwd_compile_cache[key] = compiled
+
+    dx = torch.empty_like(x)
+    sm_count = _get_sm_count(N, x.device)
+    dw_partial: torch.Tensor | None = None
+    if w is not None:
+        dw_partial = torch.empty(sm_count, N, device=x.device, dtype=torch.float32)
+
+    compiled(x, w, dout, None, rstd_flat, dx, dw_partial, None, None, sm_count)
+
+    grad_input: torch.Tensor | None = dx.reshape(input.shape)
+    grad_weight: torch.Tensor | None = (
+        dw_partial.sum(dim=0).to(weight.dtype).reshape(weight.shape)  # pyrefly: ignore[missing-attribute]
+        if weight is not None
+        else torch.Tensor()
     )
 
     if not output_mask[0]:
