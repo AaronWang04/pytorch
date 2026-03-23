@@ -1,7 +1,8 @@
-"""CuteDSL norm kernels for RMSNorm.
+"""CuteDSL norm kernels for RMSNorm and GroupNorm.
 
 These functions adapt the CuTE DSL kernel interface to match the ATen op signatures
-for ``_fused_rms_norm`` and ``_fused_rms_norm_backward``.
+for ``_fused_rms_norm``, ``_fused_rms_norm_backward``, ``native_group_norm``,
+and ``native_group_norm_backward``.
 """
 
 from __future__ import annotations
@@ -73,3 +74,57 @@ def cutedsl_rmsnorm_bwd(
         else None
     )
     return dx, dw
+
+
+_gn_weight_cache: dict[tuple, torch.Tensor] = {}
+
+
+def _expand_affine(param: torch.Tensor, group: int, cpg: int, HxW: int, N: int) -> torch.Tensor:
+    """Expand [C] affine parameter to [M, K] for fused kernel application."""
+    K = cpg * HxW
+    key = (param.data_ptr(), param.shape[0], group, cpg, HxW, N)
+    cached = _gn_weight_cache.get(key)
+    if cached is not None:
+        return cached
+    # [C] -> [group, cpg, 1] -> [group, cpg, HxW] -> [group, K] -> [M, K]
+    expanded = (
+        param.view(group, cpg, 1)
+        .expand(group, cpg, HxW)
+        .contiguous()
+        .view(group, K)
+        .repeat(N, 1)
+    )
+    _gn_weight_cache[key] = expanded
+    return expanded
+
+
+def cutedsl_groupnorm_fwd(
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from ._groupnorm_kernels import _groupnorm_fwd
+
+    cpg = C // group
+    M = N * group
+    K = cpg * HxW
+
+    x = input.view(M, K)
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    out = torch.empty(M, K, device=x.device, dtype=x.dtype)
+    mean = torch.empty(M, device=x.device, dtype=torch.float32)
+    rstd = torch.empty(M, device=x.device, dtype=torch.float32)
+
+    w_exp = _expand_affine(weight, group, cpg, HxW, N) if weight is not None else None
+    b_exp = _expand_affine(bias, group, cpg, HxW, N) if bias is not None else None
+
+    _groupnorm_fwd(x, w_exp, b_exp, out, mean, rstd, eps)
+
+    return out.view_as(input), mean.view(N, group), rstd.view(N, group)

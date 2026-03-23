@@ -1,4 +1,4 @@
-"""CuTeDSL RMSNorm overrides for aten fused RMSNorm operators."""
+"""CuTeDSL overrides for aten norm operators (RMSNorm, GroupNorm)."""
 # mypy: allow-untyped-defs
 
 from __future__ import annotations
@@ -30,6 +30,36 @@ _RMSNormBwdFallback = Callable[
     ],
     tuple[torch.Tensor | None, torch.Tensor | None],
 ]
+_GroupNormFwdFallback = Callable[
+    [
+        torch.DispatchKeySet,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        int,
+        int,
+        int,
+        int,
+        float,
+    ],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
+_GroupNormBwdFallback = Callable[
+    [
+        torch.DispatchKeySet,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        int,
+        int,
+        int,
+        int,
+        list[bool],
+    ],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
 
 
 @functools.cache
@@ -43,6 +73,13 @@ def _get_rmsnorm_kernels():
     from .norms import cutedsl_rmsnorm_bwd, cutedsl_rmsnorm_fwd
 
     return cutedsl_rmsnorm_fwd, cutedsl_rmsnorm_bwd
+
+
+@functools.cache
+def _get_groupnorm_kernels():
+    from .norms import cutedsl_groupnorm_fwd
+
+    return (cutedsl_groupnorm_fwd,)
 
 
 def _collect_tensors(*tensors: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
@@ -104,6 +141,59 @@ def _cutedsl_fused_rms_norm_backward_impl(
     return grad_input, grad_weight
 
 
+def _cutedsl_native_group_norm_impl(
+    dispatch_keys: torch.DispatchKeySet,
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    eps: float,
+    *,
+    fallback_kernel: _GroupNormFwdFallback,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _get_device_major(input.device) not in (9, 10):
+        return fallback_kernel.call_boxed(  # pyrefly: ignore[missing-attribute]
+            dispatch_keys, input, weight, bias, N, C, HxW, group, eps
+        )
+
+    (cutedsl_groupnorm_fwd,) = _get_groupnorm_kernels()
+    return cutedsl_groupnorm_fwd(input, weight, bias, N, C, HxW, group, eps)
+
+
+def _cutedsl_native_group_norm_backward_impl(
+    dispatch_keys: torch.DispatchKeySet,
+    grad_out: torch.Tensor,
+    input: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    weight: torch.Tensor | None,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    output_mask: list[bool],
+    *,
+    fallback_kernel: _GroupNormBwdFallback,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    # No cutedsl backward kernel yet, always use fallback
+    return fallback_kernel.call_boxed(  # pyrefly: ignore[missing-attribute]
+        dispatch_keys,
+        grad_out,
+        input,
+        mean,
+        rstd,
+        weight,
+        N,
+        C,
+        HxW,
+        group,
+        output_mask,
+    )
+
+
 def register_cutedsl_rmsnorm_overrides() -> None:
     if torch.cuda.is_available():
         fwd_fallback = torch.library.get_kernel("aten::_fused_rms_norm", "CUDA")
@@ -126,4 +216,27 @@ def register_cutedsl_rmsnorm_overrides() -> None:
     cu.register_op_override("aten", "_fused_rms_norm_backward", "CUDA", bwd_impl)
 
 
+def register_cutedsl_groupnorm_overrides() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    fwd_fallback = torch.library.get_kernel("aten::native_group_norm", "CUDA")
+    bwd_fallback = torch.library.get_kernel(
+        "aten::native_group_norm_backward", "CUDA"
+    )
+
+    fwd_impl = functools.partial(
+        _cutedsl_native_group_norm_impl,
+        fallback_kernel=fwd_fallback,
+    )
+    bwd_impl = functools.partial(
+        _cutedsl_native_group_norm_backward_impl,
+        fallback_kernel=bwd_fallback,
+    )
+
+    cu.register_op_override("aten", "native_group_norm", "CUDA", fwd_impl)
+    cu.register_op_override("aten", "native_group_norm_backward", "CUDA", bwd_impl)
+
+
 register_cutedsl_rmsnorm_overrides()
+register_cutedsl_groupnorm_overrides()
