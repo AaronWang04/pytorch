@@ -5,9 +5,16 @@ These functions handle tensor reshaping and memory allocation.
 
 from __future__ import annotations
 
+import importlib
 import math
+from functools import cache
 
 import torch
+
+
+@cache
+def _quack_rmsnorm():  # type: ignore[no-untyped-def]
+    return importlib.import_module("quack.rmsnorm")
 
 
 def _reshape_2d(t: torch.Tensor, M: int, N: int) -> torch.Tensor:
@@ -30,7 +37,7 @@ def quack_rmsnorm_fwd(
     normalized_shape: list[int],
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from quack.rmsnorm import _rmsnorm_fwd
+    _rmsnorm_fwd = _quack_rmsnorm()._rmsnorm_fwd
 
     input_shape = input.shape
     N = math.prod(normalized_shape)
@@ -55,7 +62,8 @@ def quack_rmsnorm_bwd(
     weight: torch.Tensor | None,
     normalized_shape: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from quack.rmsnorm import _get_sm_count, _rmsnorm_bwd
+    mod = _quack_rmsnorm()
+    _get_sm_count, _rmsnorm_bwd = mod._get_sm_count, mod._rmsnorm_bwd
 
     N = math.prod(normalized_shape)
     M = input.numel() // N

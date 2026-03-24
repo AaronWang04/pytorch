@@ -129,9 +129,7 @@ def register_rmsnorm_overrides() -> None:
         return
 
     fwd_fallback = torch.library.get_kernel("aten::_fused_rms_norm", "CUDA")
-    bwd_fallback = torch.library.get_kernel(
-        "aten::_fused_rms_norm_backward", "CUDA"
-    )
+    bwd_fallback = torch.library.get_kernel("aten::_fused_rms_norm_backward", "CUDA")
 
     fwd_impl = functools.partial(
         _fused_rms_norm_impl,
