@@ -77,9 +77,9 @@ def _get_rmsnorm_kernels():
 
 @functools.cache
 def _get_groupnorm_kernels():
-    from .norms import cutedsl_groupnorm_fwd
+    from .norms import cutedsl_groupnorm_bwd, cutedsl_groupnorm_fwd
 
-    return (cutedsl_groupnorm_fwd,)
+    return cutedsl_groupnorm_fwd, cutedsl_groupnorm_bwd
 
 
 def _collect_tensors(*tensors: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
@@ -159,7 +159,7 @@ def _cutedsl_native_group_norm_impl(
             dispatch_keys, input, weight, bias, N, C, HxW, group, eps
         )
 
-    (cutedsl_groupnorm_fwd,) = _get_groupnorm_kernels()
+    cutedsl_groupnorm_fwd, _ = _get_groupnorm_kernels()
     return cutedsl_groupnorm_fwd(input, weight, bias, N, C, HxW, group, eps)
 
 
@@ -178,19 +178,24 @@ def _cutedsl_native_group_norm_backward_impl(
     *,
     fallback_kernel: _GroupNormBwdFallback,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    # No cutedsl backward kernel yet, always use fallback
-    return fallback_kernel.call_boxed(  # pyrefly: ignore[missing-attribute]
-        dispatch_keys,
-        grad_out,
-        input,
-        mean,
-        rstd,
-        weight,
-        N,
-        C,
-        HxW,
-        group,
-        output_mask,
+    if _get_device_major(input.device) not in (9, 10):
+        return fallback_kernel.call_boxed(  # pyrefly: ignore[missing-attribute]
+            dispatch_keys,
+            grad_out,
+            input,
+            mean,
+            rstd,
+            weight,
+            N,
+            C,
+            HxW,
+            group,
+            output_mask,
+        )
+
+    _, cutedsl_groupnorm_bwd = _get_groupnorm_kernels()
+    return cutedsl_groupnorm_bwd(
+        grad_out, input, mean, rstd, weight, N, C, HxW, group, output_mask
     )
 
 

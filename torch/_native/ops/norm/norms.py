@@ -82,7 +82,7 @@ _gn_weight_cache: dict[tuple, torch.Tensor] = {}
 def _expand_affine(param: torch.Tensor, group: int, cpg: int, HxW: int, N: int) -> torch.Tensor:
     """Expand [C] affine parameter to [M, K] for fused kernel application."""
     K = cpg * HxW
-    key = (param.data_ptr(), param.shape[0], group, cpg, HxW, N)
+    key = (param.data_ptr(), param.dtype, param.shape[0], group, cpg, HxW, N)
     cached = _gn_weight_cache.get(key)
     if cached is not None:
         return cached
@@ -128,3 +128,59 @@ def cutedsl_groupnorm_fwd(
     _groupnorm_fwd(x, w_exp, b_exp, out, mean, rstd, eps)
 
     return out.view_as(input), mean.view(N, group), rstd.view(N, group)
+
+
+def cutedsl_groupnorm_bwd(
+    grad_out: torch.Tensor,
+    input: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    weight: torch.Tensor | None,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    output_mask: list[bool],
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    from ._groupnorm_kernels import _get_sm_count, _groupnorm_bwd
+
+    cpg = C // group
+    M = N * group
+    K = cpg * HxW
+
+    x = input.view(M, K)
+    if not x.is_contiguous():
+        x = x.contiguous()
+    dout = grad_out.view(M, K)
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    mean_flat = mean.view(M).contiguous()
+    rstd_flat = rstd.view(M).contiguous()
+
+    w_exp = _expand_affine(weight, group, cpg, HxW, N) if weight is not None else None
+
+    dx = torch.empty_like(x)
+    sm_count = _get_sm_count(K, x.device)
+
+    _groupnorm_bwd(x, w_exp, dout, mean_flat, rstd_flat, dx, None, None, sm_count)
+
+    grad_input = dx.view_as(input) if output_mask[0] else None
+
+    # Compute dw/db outside the kernel: the kernel's [M, K] layout mixes groups
+    # so per-channel reductions must be done in Python.
+    # x_hat = (x - mean) * rstd, shape [M, K]
+    # dw[c] = sum_{n, hw} dout[n,c,hw] * x_hat[n,c,hw]
+    # db[c] = sum_{n, hw} dout[n,c,hw]
+    grad_weight: torch.Tensor | None = None
+    if output_mask[1] and weight is not None:
+        rstd_exp = rstd_flat.unsqueeze(1)  # [M, 1]
+        mean_exp = mean_flat.unsqueeze(1)  # [M, 1]
+        x_hat = (x.float() - mean_exp) * rstd_exp  # [M, K]
+        # Reshape to [N, group, cpg, HxW], sum over N and HxW -> [group, cpg] -> [C]
+        dw = (dout.float() * x_hat).view(N, group, cpg, HxW).sum(dim=(0, 3)).view(C)
+        grad_weight = dw.to(weight.dtype)
+    grad_bias: torch.Tensor | None = None
+    if output_mask[2]:
+        db = dout.float().view(N, group, cpg, HxW).sum(dim=(0, 3)).view(C)
+        grad_bias = db.to(input.dtype)
+    return grad_input, grad_weight, grad_bias
