@@ -1,8 +1,7 @@
 """Quack-backed RMSNorm overrides for aten fused RMSNorm operators.
 
-Requires the ``quack-kernels`` package (https://github.com/pytorch-labs/quack).
-When quack is not installed the overrides are silently skipped and the default
-ATen CUDA kernels remain active.
+Requires the `quack-kernels` package (https://github.com/Dao-AILab/quack)
+When quack is not installed the overrides are silently skipped
 """
 # mypy: allow-untyped-defs
 
