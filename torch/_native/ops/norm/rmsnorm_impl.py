@@ -1,9 +1,15 @@
-"""CuTeDSL RMSNorm overrides for aten fused RMSNorm operators."""
+"""Quack-backed RMSNorm overrides for aten fused RMSNorm operators.
+
+Requires the ``quack-kernels`` package (https://github.com/pytorch-labs/quack).
+When quack is not installed the overrides are silently skipped and the default
+ATen CUDA kernels remain active.
+"""
 # mypy: allow-untyped-defs
 
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
 from collections.abc import Callable
 
@@ -13,6 +19,15 @@ from ... import cutedsl_utils as cu
 
 
 log = logging.getLogger(__name__)
+
+
+def _quack_available() -> bool:
+    try:
+        importlib.import_module("quack.rmsnorm")
+        return True
+    except ModuleNotFoundError:
+        return False
+
 
 _RMSNormFwdFallback = Callable[
     [torch.DispatchKeySet, torch.Tensor, list[int], torch.Tensor | None, float | None],
@@ -38,17 +53,6 @@ def _get_device_major(device: torch.device) -> int:
     return major
 
 
-@functools.cache
-def _get_rmsnorm_kernels():
-    from .norms import cutedsl_rmsnorm_bwd, cutedsl_rmsnorm_fwd
-
-    return cutedsl_rmsnorm_fwd, cutedsl_rmsnorm_bwd
-
-
-def _collect_tensors(*tensors: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
-    return tuple(t for t in tensors if t is not None)
-
-
 def _support_error(
     input: torch.Tensor,
     name: str,
@@ -59,7 +63,8 @@ def _support_error(
         return f"CuTeDSL {name} requires compute capability 9.0 or 10.0"
     return None
 
-def _cutedsl_fused_rms_norm_impl(
+
+def _fused_rms_norm_impl(
     dispatch_keys: torch.DispatchKeySet,
     input: torch.Tensor,
     normalized_shape: list[int],
@@ -68,7 +73,6 @@ def _cutedsl_fused_rms_norm_impl(
     *,
     fallback_kernel: _RMSNormFwdFallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-
     error = _support_error(input, "RMSNorm")
     if error is not None:
         return fallback_kernel(dispatch_keys, input, normalized_shape, weight, eps)
@@ -76,11 +80,12 @@ def _cutedsl_fused_rms_norm_impl(
     if eps is None:
         eps = torch.finfo(input.dtype).eps
 
-    cutedsl_rmsnorm_fwd, _ = _get_rmsnorm_kernels()
-    return cutedsl_rmsnorm_fwd(input, weight, normalized_shape, eps)
+    from .norms import quack_rmsnorm_fwd
+
+    return quack_rmsnorm_fwd(input, weight, normalized_shape, eps)
 
 
-def _cutedsl_fused_rms_norm_backward_impl(
+def _fused_rms_norm_backward_impl(
     dispatch_keys: torch.DispatchKeySet,
     grad_out: torch.Tensor,
     input: torch.Tensor,
@@ -103,8 +108,9 @@ def _cutedsl_fused_rms_norm_backward_impl(
             output_mask,
         )
 
-    _, cutedsl_rmsnorm_bwd = _get_rmsnorm_kernels()
-    grad_input, grad_weight = cutedsl_rmsnorm_bwd(
+    from .norms import quack_rmsnorm_bwd
+
+    grad_input, grad_weight = quack_rmsnorm_bwd(
         grad_out, input, rstd, weight, normalized_shape
     )
 
@@ -115,21 +121,25 @@ def _cutedsl_fused_rms_norm_backward_impl(
     return grad_input, grad_weight
 
 
-def register_cutedsl_rmsnorm_overrides() -> None:
-    if torch.cuda.is_available():
-        fwd_fallback = torch.library.get_kernel("aten::_fused_rms_norm", "CUDA")
-        bwd_fallback = torch.library.get_kernel(
-            "aten::_fused_rms_norm_backward", "CUDA"
-        )
-    else:
+def register_rmsnorm_overrides() -> None:
+    if not _quack_available():
+        log.debug("quack-kernels not installed, skipping CuTeDSL RMSNorm overrides")
         return
 
+    if not torch.cuda.is_available():
+        return
+
+    fwd_fallback = torch.library.get_kernel("aten::_fused_rms_norm", "CUDA")
+    bwd_fallback = torch.library.get_kernel(
+        "aten::_fused_rms_norm_backward", "CUDA"
+    )
+
     fwd_impl = functools.partial(
-        _cutedsl_fused_rms_norm_impl,
+        _fused_rms_norm_impl,
         fallback_kernel=fwd_fallback,
     )
     bwd_impl = functools.partial(
-        _cutedsl_fused_rms_norm_backward_impl,
+        _fused_rms_norm_backward_impl,
         fallback_kernel=bwd_fallback,
     )
 
@@ -137,4 +147,4 @@ def register_cutedsl_rmsnorm_overrides() -> None:
     cu.register_op_override("aten", "_fused_rms_norm_backward", "CUDA", bwd_impl)
 
 
-register_cutedsl_rmsnorm_overrides()
+register_rmsnorm_overrides()

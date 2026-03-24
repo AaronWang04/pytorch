@@ -1,1 +1,1 @@
-from . import cutedsl_impl  # noqa: F401
+from . import rmsnorm_impl  # noqa: F401
