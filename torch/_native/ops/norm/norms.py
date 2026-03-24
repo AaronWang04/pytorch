@@ -1,8 +1,6 @@
-"""Adapt quack's 2-D RMSNorm kernel interface to ATen op signatures.
+"""Adaptor for quack's 2-D RMSNorm kernel interface to match ATen op signatures.
 
-These functions handle tensor reshaping and memory allocation so the
-dispatcher override layer (``rmsnorm_impl.py``) can stay focused on
-support checks and fallback logic.
+These functions handle tensor reshaping and memory allocation.
 """
 
 from __future__ import annotations
