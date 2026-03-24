@@ -82,20 +82,14 @@ _gn_weight_cache: dict[tuple, torch.Tensor] = {}
 def _expand_affine(param: torch.Tensor, group: int, cpg: int, HxW: int, N: int) -> torch.Tensor:
     """Expand [C] affine parameter to [M, K] for fused kernel application."""
     K = cpg * HxW
-    key = (param.data_ptr(), param.dtype, param.shape[0], group, cpg, HxW, N)
-    cached = _gn_weight_cache.get(key)
-    if cached is not None:
-        return cached
     # [C] -> [group, cpg, 1] -> [group, cpg, HxW] -> [group, K] -> [M, K]
-    expanded = (
+    return (
         param.view(group, cpg, 1)
         .expand(group, cpg, HxW)
         .contiguous()
         .view(group, K)
         .repeat(N, 1)
     )
-    _gn_weight_cache[key] = expanded
-    return expanded
 
 
 def cutedsl_groupnorm_fwd(
@@ -122,10 +116,10 @@ def cutedsl_groupnorm_fwd(
     mean = torch.empty(M, device=x.device, dtype=torch.float32)
     rstd = torch.empty(M, device=x.device, dtype=torch.float32)
 
-    w_exp = _expand_affine(weight, group, cpg, HxW, N) if weight is not None else None
-    b_exp = _expand_affine(bias, group, cpg, HxW, N) if bias is not None else None
-
-    _groupnorm_fwd(x, w_exp, b_exp, out, mean, rstd, eps)
+    if M > 0:
+        w_exp = _expand_affine(weight, group, cpg, HxW, N) if weight is not None else None
+        b_exp = _expand_affine(bias, group, cpg, HxW, N) if bias is not None else None
+        _groupnorm_fwd(x, w_exp, b_exp, out, mean, rstd, eps)
 
     return out.view_as(input), mean.view(N, group), rstd.view(N, group)
 
@@ -147,6 +141,12 @@ def cutedsl_groupnorm_bwd(
     cpg = C // group
     M = N * group
     K = cpg * HxW
+
+    if M == 0:
+        grad_input = input.new_empty(input.shape) if output_mask[0] else None
+        grad_weight = weight.new_zeros(weight.shape) if output_mask[1] and weight is not None else None
+        grad_bias = input.new_zeros(C) if output_mask[2] else None
+        return grad_input, grad_weight, grad_bias
 
     x = input.view(M, K)
     if not x.is_contiguous():
