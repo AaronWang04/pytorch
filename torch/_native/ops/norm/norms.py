@@ -1,6 +1,8 @@
 """Adaptor for quack's 2-D RMSNorm kernel interface to match ATen op signatures.
 
-These functions handle tensor reshaping and memory allocation.
+These functions handle tensor reshaping, memory allocation, and call quack's
+compiled kernels directly (bypassing the ``@torch.library.custom_op`` wrapper
+to avoid dispatcher overhead).
 """
 
 from __future__ import annotations
@@ -15,6 +17,17 @@ import torch
 @cache
 def _quack_rmsnorm():  # type: ignore[no-untyped-def]
     return importlib.import_module("quack.rmsnorm")
+
+
+@cache
+def _quack_cute_dsl_utils():  # type: ignore[no-untyped-def]
+    return importlib.import_module("quack.cute_dsl_utils")
+
+
+def _torch2cute(t: torch.Tensor | None):  # type: ignore[no-untyped-def]
+    if t is None:
+        return None
+    return _quack_cute_dsl_utils().torch2cute_dtype_map[t.dtype]
 
 
 def _reshape_2d(t: torch.Tensor, M: int, N: int) -> torch.Tensor:
@@ -37,8 +50,6 @@ def quack_rmsnorm_fwd(
     normalized_shape: list[int],
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _rmsnorm_fwd = _quack_rmsnorm()._rmsnorm_fwd
-
     input_shape = input.shape
     N = math.prod(normalized_shape)
     M = input.numel() // N
@@ -49,7 +60,16 @@ def quack_rmsnorm_fwd(
 
     if weight is not None and weight.ndim != 1:
         weight = weight.view(N)
-    _rmsnorm_fwd(x, weight, out, None, rstd, None, None, None, eps)
+
+    dtype = _torch2cute(x)
+    out_dtype = _torch2cute(out)
+    weight_dtype = _torch2cute(weight)
+
+    kernel = _quack_rmsnorm()._compile_rmsnorm_fwd(
+        dtype, out_dtype, None, weight_dtype, None, None,
+        N, True, False, False,
+    )
+    kernel(x, weight, None, None, out, None, rstd, None, eps)
 
     out = out.reshape(input_shape)
     return out, rstd
@@ -63,7 +83,6 @@ def quack_rmsnorm_bwd(
     normalized_shape: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     mod = _quack_rmsnorm()
-    _get_sm_count, _rmsnorm_bwd = mod._get_sm_count, mod._rmsnorm_bwd
 
     N = math.prod(normalized_shape)
     M = input.numel() // N
@@ -72,12 +91,21 @@ def quack_rmsnorm_bwd(
     rstd_flat = _flatten_rstd(rstd, M)
 
     dx = torch.empty_like(x)
-    sm_count = _get_sm_count(N, x.device)
+    sm_count = mod._get_sm_count(N, x.device)
     dw_partial: torch.Tensor | None = None
     if weight is not None:
         dw_partial = torch.empty(sm_count, N, device=x.device, dtype=torch.float32)
 
-    _rmsnorm_bwd(x, weight, dout, rstd_flat, dx, dw_partial, None, None, None, sm_count)
+    dtype = _torch2cute(x)
+    dout_dtype = _torch2cute(dout)
+    dx_dtype = _torch2cute(dx)
+    weight_dtype = _torch2cute(weight)
+
+    kernel = mod._compile_rmsnorm_bwd(
+        N, dtype, dout_dtype, dx_dtype, weight_dtype,
+        False, None, None, dw_partial is not None,
+    )
+    kernel(x, weight, dout, None, rstd_flat, dx, dw_partial, None, None, sm_count)
 
     dx = dx.reshape(input.shape)
     dw = (
