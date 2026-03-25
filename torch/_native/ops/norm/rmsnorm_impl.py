@@ -116,13 +116,12 @@ def _fused_rms_norm_backward_impl(
     from .norms import quack_rmsnorm_bwd
 
     grad_input, grad_weight = quack_rmsnorm_bwd(
-        grad_out, input, rstd, weight, normalized_shape
+        grad_out, input, rstd, weight, normalized_shape,
+        dw_mask=output_mask[1],
     )
 
     if not output_mask[0]:
         grad_input = None
-    if not output_mask[1]:
-        grad_weight = None
     return grad_input, grad_weight
 
 

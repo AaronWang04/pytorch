@@ -82,6 +82,7 @@ def quack_rmsnorm_bwd(
     rstd: torch.Tensor,
     weight: torch.Tensor | None,
     normalized_shape: list[int],
+    dw_mask: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     mod = _quack_rmsnorm()
 
@@ -94,25 +95,26 @@ def quack_rmsnorm_bwd(
     dx = torch.empty_like(x)
     sm_count = mod._get_sm_count(N, x.device)
     dw_partial: torch.Tensor | None = None
-    if weight is not None:
+    if weight is not None and dw_mask:
         dw_partial = torch.empty(sm_count, N, device=x.device, dtype=torch.float32)
 
     dtype = _torch2cute(x)
     dout_dtype = _torch2cute(dout)
     dx_dtype = _torch2cute(dx)
-    weight_dtype = _torch2cute(weight)
+    weight_dtype = _torch2cute(weight) if dw_mask else None
 
     kernel = mod._compile_rmsnorm_bwd(
         N, dtype, dout_dtype, dx_dtype, weight_dtype,
         False, None, None, dw_partial is not None,
     )
     # compile order: (x, weight, dout, dres_out, rstd, dx, dw_partial, dres, db_partial, sm_count)
-    kernel(x, weight, dout, None, rstd_flat, dx, dw_partial, None, None, sm_count)
+    w = weight if dw_mask else None
+    kernel(x, w, dout, None, rstd_flat, dx, dw_partial, None, None, sm_count)
 
     dx = dx.reshape(input.shape)
     dw = (
         dw_partial.sum(dim=0, dtype=weight.dtype)  # pyrefly: ignore[missing-attribute]
-        if weight is not None
+        if dw_partial is not None
         else None
     )
     return dx, dw
