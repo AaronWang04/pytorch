@@ -49,7 +49,7 @@ def quack_rmsnorm_fwd(
 
     if weight is not None and weight.ndim != 1:
         weight = weight.view(N)
-    _rmsnorm_fwd(x, weight, out, None, rstd, None, None, eps)
+    _rmsnorm_fwd(x, weight, out, None, rstd, None, None, None, eps)
 
     out = out.reshape(input_shape)
     return out, rstd
