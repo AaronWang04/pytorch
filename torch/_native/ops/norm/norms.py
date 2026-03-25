@@ -69,6 +69,7 @@ def quack_rmsnorm_fwd(
         dtype, out_dtype, None, weight_dtype, None, None,
         N, True, False, False,
     )
+    # compile order: (x, weight, bias, res, out, res_out, rstd, mean, eps)
     kernel(x, weight, None, None, out, None, rstd, None, eps)
 
     out = out.reshape(input_shape)
@@ -105,6 +106,7 @@ def quack_rmsnorm_bwd(
         N, dtype, dout_dtype, dx_dtype, weight_dtype,
         False, None, None, dw_partial is not None,
     )
+    # compile order: (x, weight, dout, dres_out, rstd, dx, dw_partial, dres, db_partial, sm_count)
     kernel(x, weight, dout, None, rstd_flat, dx, dw_partial, None, None, sm_count)
 
     dx = dx.reshape(input.shape)
