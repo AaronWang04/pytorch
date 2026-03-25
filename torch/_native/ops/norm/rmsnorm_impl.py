@@ -7,6 +7,7 @@ When quack is not installed the overrides are silently skipped
 
 from __future__ import annotations
 
+import os
 import functools
 import importlib
 import logging
@@ -14,7 +15,8 @@ from collections.abc import Callable
 
 import torch
 
-from ... import cutedsl_utils as cu
+from ...common_utils import check_native_jit_disabled
+from ...registry import _register_op_override
 
 
 log = logging.getLogger(__name__)
@@ -22,6 +24,10 @@ log = logging.getLogger(__name__)
 
 def _quack_available() -> bool:
     try:
+        # Disable quack's .o disk cache before first import — loading
+        # cached objects can segfault due to a quack jit_cache bug.
+        # Aaron: will try and fix this on quack side
+        os.environ.setdefault("QUACK_CACHE_ENABLED", "0")
         importlib.import_module("quack.rmsnorm")
         return True
     except ModuleNotFoundError:
@@ -122,7 +128,10 @@ def _fused_rms_norm_backward_impl(
 
 def register_rmsnorm_overrides() -> None:
     if not _quack_available():
-        log.debug("quack-kernels not installed, skipping CuTeDSL RMSNorm overrides")
+        log.debug("quack-kernels not installed, skipping RMSNorm overrides")
+        return
+
+    if check_native_jit_disabled():
         return
 
     if not torch.cuda.is_available():
@@ -140,8 +149,8 @@ def register_rmsnorm_overrides() -> None:
         fallback_kernel=bwd_fallback,
     )
 
-    cu.register_op_override("aten", "_fused_rms_norm", "CUDA", fwd_impl)
-    cu.register_op_override("aten", "_fused_rms_norm_backward", "CUDA", bwd_impl)
+    _register_op_override("aten", "_fused_rms_norm", "CUDA", fwd_impl)
+    _register_op_override("aten", "_fused_rms_norm_backward", "CUDA", bwd_impl)
 
 
 register_rmsnorm_overrides()
