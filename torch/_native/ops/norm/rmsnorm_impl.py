@@ -7,31 +7,28 @@ When quack is not installed the overrides are silently skipped
 
 from __future__ import annotations
 
-import os
 import functools
 import importlib
 import logging
+import os
 from collections.abc import Callable
 
 import torch
 
-from ...common_utils import check_native_jit_disabled
-from ...registry import _register_op_override
+from ... import cutedsl_utils as cu
 
 
 log = logging.getLogger(__name__)
 
 
 def _quack_available() -> bool:
-    try:
-        # Disable quack's .o disk cache before first import — loading
-        # cached objects can segfault due to a quack jit_cache bug.
-        # Aaron: will try and fix this on quack side
-        os.environ.setdefault("QUACK_CACHE_ENABLED", "0")
-        importlib.import_module("quack.rmsnorm")
-        return True
-    except ModuleNotFoundError:
+    if importlib.util.find_spec("quack.rmsnorm") is None:
         return False
+    # Disable quack's .o disk cache before first import — loading
+    # cached objects can segfault due to a quack jit_cache bug.
+    # Aaron: will try and fix this on quack side
+    os.environ.setdefault("QUACK_CACHE_ENABLED", "0")
+    return True
 
 
 _RMSNormFwdFallback = Callable[
@@ -58,15 +55,12 @@ def _get_device_major(device: torch.device) -> int:
     return major
 
 
-def _support_error(
-    input: torch.Tensor,
-    name: str,
-) -> str | None:
-    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        return "input dtype must be float16, bfloat16, or float32"
-    if _get_device_major(input.device) not in (9, 10):
-        return f"CuTeDSL {name} requires compute capability 9.0 or 10.0"
-    return None
+def _is_supported(input: torch.Tensor) -> bool:
+    return input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ) and _get_device_major(input.device) in (9, 10)
 
 
 def _fused_rms_norm_impl(
@@ -78,8 +72,7 @@ def _fused_rms_norm_impl(
     *,
     fallback_kernel: _RMSNormFwdFallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    error = _support_error(input, "RMSNorm")
-    if error is not None:
+    if not _is_supported(input):
         return fallback_kernel(dispatch_keys, input, normalized_shape, weight, eps)
 
     if eps is None:
@@ -101,8 +94,7 @@ def _fused_rms_norm_backward_impl(
     *,
     fallback_kernel: _RMSNormBwdFallback,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    error = _support_error(input, "RMSNorm backward")
-    if error is not None:
+    if not _is_supported(input):
         return fallback_kernel.call_boxed(  # pyrefly: ignore[missing-attribute]
             dispatch_keys,
             grad_out,
@@ -116,7 +108,11 @@ def _fused_rms_norm_backward_impl(
     from .norms import quack_rmsnorm_bwd
 
     grad_input, grad_weight = quack_rmsnorm_bwd(
-        grad_out, input, rstd, weight, normalized_shape,
+        grad_out,
+        input,
+        rstd,
+        weight,
+        normalized_shape,
         dw_mask=output_mask[1],
     )
 
@@ -128,9 +124,6 @@ def _fused_rms_norm_backward_impl(
 def register_rmsnorm_overrides() -> None:
     if not _quack_available():
         log.debug("quack-kernels not installed, skipping RMSNorm overrides")
-        return
-
-    if check_native_jit_disabled():
         return
 
     if not torch.cuda.is_available():
@@ -148,8 +141,8 @@ def register_rmsnorm_overrides() -> None:
         fallback_kernel=bwd_fallback,
     )
 
-    _register_op_override("aten", "_fused_rms_norm", "CUDA", fwd_impl)
-    _register_op_override("aten", "_fused_rms_norm_backward", "CUDA", bwd_impl)
+    cu.register_op_override("aten", "_fused_rms_norm", "CUDA", fwd_impl)
+    cu.register_op_override("aten", "_fused_rms_norm_backward", "CUDA", bwd_impl)
 
 
 register_rmsnorm_overrides()

@@ -66,8 +66,16 @@ def quack_rmsnorm_fwd(
     weight_dtype = _torch2cute(weight)
 
     kernel = _quack_rmsnorm()._compile_rmsnorm_fwd(
-        dtype, out_dtype, None, weight_dtype, None, None,
-        N, True, False, False,
+        dtype,
+        out_dtype,
+        None,
+        weight_dtype,
+        None,
+        None,
+        N,
+        True,
+        False,
+        False,
     )
     # compile order: (x, weight, bias, res, out, res_out, rstd, mean, eps)
     kernel(x, weight, None, None, out, None, rstd, None, eps)
@@ -104,8 +112,15 @@ def quack_rmsnorm_bwd(
     weight_dtype = _torch2cute(weight) if dw_mask else None
 
     kernel = mod._compile_rmsnorm_bwd(
-        N, dtype, dout_dtype, dx_dtype, weight_dtype,
-        False, None, None, dw_partial is not None,
+        N,
+        dtype,
+        dout_dtype,
+        dx_dtype,
+        weight_dtype,
+        False,
+        None,
+        None,
+        dw_partial is not None,
     )
     # compile order: (x, weight, dout, dres_out, rstd, dx, dw_partial, dres, db_partial, sm_count)
     w = weight if dw_mask else None
