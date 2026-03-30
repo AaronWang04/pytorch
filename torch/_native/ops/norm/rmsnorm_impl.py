@@ -22,12 +22,14 @@ log = logging.getLogger(__name__)
 
 
 def _quack_available() -> bool:
-    if importlib.util.find_spec("quack.rmsnorm") is None:
-        return False
     # Disable quack's .o disk cache before first import — loading
     # cached objects can segfault due to a quack jit_cache bug.
-    # Aaron: will try and fix this on quack side
+    # Aaron: will try and fix this on quack side.
+    # Must be set before find_spec because that triggers quack.__init__
+    # which imports quack.cache_utils.
     os.environ.setdefault("QUACK_CACHE_ENABLED", "0")
+    if importlib.util.find_spec("quack") is None:
+        return False
     return True
 
 
