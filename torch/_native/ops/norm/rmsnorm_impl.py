@@ -13,24 +13,46 @@ import logging
 import os
 from collections.abc import Callable
 
+from packaging.version import Version
+
 import torch
 
 from ... import cutedsl_utils as cu
+from ...common_utils import _available_version, check_native_version_skip
 
 
 log = logging.getLogger(__name__)
 
 
+_QUACK_REQUIRED_VERSIONS: set[Version] = {
+    Version(f"{0}.{3}.{7}"),
+}
+
+
 def _quack_available() -> bool:
     # Disable quack's .o disk cache before first import — loading
     # cached objects can segfault due to a quack jit_cache bug.
-    # Aaron: will try and fix this on quack side.
     # Must be set before find_spec because that triggers quack.__init__
     # which imports quack.cache_utils.
     os.environ.setdefault("QUACK_CACHE_ENABLED", "0")
     if importlib.util.find_spec("quack") is None:
         return False
     return True
+
+
+@functools.cache
+def _quack_version_is_ok() -> bool:
+    version = _available_version("quack-kernels")
+    if check_native_version_skip() or (version in _QUACK_REQUIRED_VERSIONS):
+        return True
+
+    log.info(
+        "quack-kernels version %s is not known-good (ok: %s); "
+        "set TORCH_NATIVE_SKIP_VERSION_CHECK=1 to override",
+        version,
+        _QUACK_REQUIRED_VERSIONS,
+    )
+    return False
 
 
 _RMSNormFwdFallback = Callable[
@@ -75,7 +97,9 @@ def _fused_rms_norm_impl(
     fallback_kernel: _RMSNormFwdFallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not _is_supported(input):
-        return fallback_kernel.call_boxed(dispatch_keys, input, normalized_shape, weight, eps)
+        return fallback_kernel.call_boxed(  # pyrefly: ignore[missing-attribute]
+            dispatch_keys, input, normalized_shape, weight, eps
+        )
 
     if eps is None:
         eps = torch.finfo(input.dtype).eps
@@ -126,6 +150,9 @@ def _fused_rms_norm_backward_impl(
 def register_rmsnorm_overrides() -> None:
     if not _quack_available():
         log.debug("quack-kernels not installed, skipping RMSNorm overrides")
+        return
+
+    if not _quack_version_is_ok():
         return
 
     if not torch.cuda.is_available():
