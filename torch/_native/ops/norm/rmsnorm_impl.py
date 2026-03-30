@@ -75,7 +75,7 @@ def _fused_rms_norm_impl(
     fallback_kernel: _RMSNormFwdFallback,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not _is_supported(input):
-        return fallback_kernel(dispatch_keys, input, normalized_shape, weight, eps)
+        return fallback_kernel.call_boxed(dispatch_keys, input, normalized_shape, weight, eps)
 
     if eps is None:
         eps = torch.finfo(input.dtype).eps
