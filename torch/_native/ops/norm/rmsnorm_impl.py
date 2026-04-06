@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 
 _QUACK_REQUIRED_VERSIONS: set[Version] = {
+    Version(f"{0}.{3}.{6}"),
     Version(f"{0}.{3}.{7}"),
 }
 
