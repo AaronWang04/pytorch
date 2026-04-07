@@ -101,16 +101,16 @@ def quack_rmsnorm_bwd(
     rstd_flat = _flatten_rstd(rstd, M)
 
     dx = torch.empty_like(x)
-    sm_count = mod._get_sm_count(N, x.device)
     dw_partial: torch.Tensor | None = None
     dw: torch.Tensor | None = None
     semaphore: torch.Tensor | None = None
-    use_in_kernel_dw_reduction = N <= 8192
+    use_in_kernel_dw_reduction = N <= 8192 and weight is not None
+    sm_count = mod._get_sm_count(N, x.device, fused_reduction=use_in_kernel_dw_reduction)
     if weight is not None and dw_mask:
         dw_partial = torch.empty(sm_count, N, device=x.device, dtype=torch.float32)
         if use_in_kernel_dw_reduction:
             dw = torch.empty(N, device=x.device, dtype=weight.dtype)
-            semaphore = torch.zeros(1, device=x.device, dtype=torch.int32)
+            semaphore = mod._get_semaphore(x.device)
 
     dtype = _torch2cute(x)
     dout_dtype = _torch2cute(dout)
