@@ -13,7 +13,7 @@ import logging
 import os
 from collections.abc import Callable
 
-from packaging.version import Version
+from torch._vendor.packaging.version import Version
 
 import torch
 
