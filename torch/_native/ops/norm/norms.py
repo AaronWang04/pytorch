@@ -81,6 +81,10 @@ def quack_rmsnorm_fwd(
     kernel(x, weight, None, None, out, None, rstd, None, eps)
 
     out = out.reshape(input_shape)
+    stat_shape = list(input_shape[: -len(normalized_shape)]) + [1] * len(
+        normalized_shape
+    )
+    rstd = rstd.view(stat_shape)
     return out, rstd
 
 
