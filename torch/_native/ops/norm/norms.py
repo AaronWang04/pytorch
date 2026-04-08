@@ -122,7 +122,7 @@ def quack_rmsnorm_bwd(
     dx = torch.empty_like(x)
     dw_partial: torch.Tensor | None = None
     dw: torch.Tensor | None = None
-    use_in_kernel_dw_reduction = N <= 8192 and weight is not None
+    use_in_kernel_dw_reduction = N <= 4096 and weight is not None
     sm_count = mod._get_sm_count(N, x.device)
     if weight is not None and dw_mask:
         dw_partial = _get_dw_partial(sm_count, N, x.device)
@@ -155,5 +155,7 @@ def quack_rmsnorm_bwd(
     if dw is not None:
         dw = dw.to(weight.dtype)  # pyrefly: ignore[missing-attribute]
     elif dw_partial is not None:
-        dw = dw_partial.sum(dim=0, dtype=weight.dtype)  # pyrefly: ignore[missing-attribute]
+        dw = dw_partial.sum(
+            dim=0, dtype=weight.dtype
+        )  # pyrefly: ignore[missing-attribute]
     return dx, dw
