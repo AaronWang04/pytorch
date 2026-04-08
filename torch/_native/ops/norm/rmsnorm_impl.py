@@ -13,9 +13,8 @@ import logging
 import os
 from collections.abc import Callable
 
-from torch._vendor.packaging.version import Version
-
 import torch
+from torch._vendor.packaging.version import Version
 
 from ... import cutedsl_utils as cu
 from ...common_utils import _available_version, check_native_version_skip
