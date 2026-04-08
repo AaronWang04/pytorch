@@ -84,6 +84,25 @@ def quack_rmsnorm_fwd(
     return out, rstd
 
 
+_dw_buf: dict[tuple[int, torch.device], torch.Tensor] = {}
+_dwp_buf: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+
+
+def _get_dw_zero(N: int, device: torch.device) -> torch.Tensor:
+    key = (N, device)
+    if key not in _dw_buf:
+        _dw_buf[key] = torch.empty(N, device=device, dtype=torch.float32)
+    _dw_buf[key].zero_()
+    return _dw_buf[key]
+
+
+def _get_dw_partial(sm_count: int, N: int, device: torch.device) -> torch.Tensor:
+    key = (sm_count, N, device)
+    if key not in _dwp_buf:
+        _dwp_buf[key] = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+    return _dwp_buf[key]
+
+
 def quack_rmsnorm_bwd(
     grad_out: torch.Tensor,
     input: torch.Tensor,
@@ -103,20 +122,18 @@ def quack_rmsnorm_bwd(
     dx = torch.empty_like(x)
     dw_partial: torch.Tensor | None = None
     dw: torch.Tensor | None = None
-    semaphore: torch.Tensor | None = None
     use_in_kernel_dw_reduction = N <= 8192 and weight is not None
-    sm_count = mod._get_sm_count(N, x.device, fused_reduction=use_in_kernel_dw_reduction)
+    sm_count = mod._get_sm_count(N, x.device)
     if weight is not None and dw_mask:
-        dw_partial = torch.empty(sm_count, N, device=x.device, dtype=torch.float32)
+        dw_partial = _get_dw_partial(sm_count, N, x.device)
         if use_in_kernel_dw_reduction:
-            dw = torch.empty(N, device=x.device, dtype=weight.dtype)
-            semaphore = mod._get_semaphore(x.device)
+            dw = _get_dw_zero(N, x.device)
 
     dtype = _torch2cute(x)
     dout_dtype = _torch2cute(dout)
     dx_dtype = _torch2cute(dx)
     weight_dtype = _torch2cute(weight) if dw_mask else None
-    dw_dtype = weight_dtype if use_in_kernel_dw_reduction and dw_partial is not None else None
+    dw_dtype = _torch2cute(dw) if dw is not None else None
 
     kernel = mod._compile_rmsnorm_bwd(
         N,
@@ -130,11 +147,13 @@ def quack_rmsnorm_bwd(
         dw_partial is not None,
         dw_dtype,
     )
-    # compile order: (x, weight, dout, dres_out, rstd, dx, dw_partial, dw_final, dres, db_partial, semaphore, sm_count)
+    # compile order: (x, weight, dout, dres_out, rstd, dx, dw_partial, dw_final, dres, db_partial, sm_count)
     w = weight if dw_mask else None
-    kernel(x, w, dout, None, rstd_flat, dx, dw_partial, dw, None, None, semaphore, sm_count)
+    kernel(x, w, dout, None, rstd_flat, dx, dw_partial, dw, None, None, sm_count)
 
     dx = dx.reshape(input.shape)
-    if dw is None and dw_partial is not None:
+    if dw is not None:
+        dw = dw.to(weight.dtype)  # pyrefly: ignore[missing-attribute]
+    elif dw_partial is not None:
         dw = dw_partial.sum(dim=0, dtype=weight.dtype)  # pyrefly: ignore[missing-attribute]
     return dx, dw
