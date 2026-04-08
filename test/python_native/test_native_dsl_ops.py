@@ -608,9 +608,7 @@ class TestRMSNormQuackOverride(TestCase):
             w = torch.randn(*normalized_shape, dtype=dtype, device="cuda")
 
             # quack override active
-            y, rstd = torch.ops.aten._fused_rms_norm(
-                x, normalized_shape, w, self.EPS
-            )
+            y, rstd = torch.ops.aten._fused_rms_norm(x, normalized_shape, w, self.EPS)
 
             # ATen fallback
             with torch.backends.python_native.operations_disabled(
@@ -634,24 +632,22 @@ class TestRMSNormQuackOverride(TestCase):
     @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
     def test_fused_rms_norm_bwd(self, dtype):
         # w_grad reduces across the batch dimension so errors accumulate
-        atol = 3e-1 if dtype == torch.bfloat16 else (1e-1 if dtype == torch.float16 else 1e-5)
+        atol = (
+            3e-1
+            if dtype == torch.bfloat16
+            else (1e-1 if dtype == torch.float16 else 1e-5)
+        )
 
         for shape in self.SHAPES:
             normalized_shape = list(shape[-1:])
-            x = torch.randn(
-                *shape, dtype=dtype, device="cuda"
-            )
-            w = torch.randn(
-                *normalized_shape, dtype=dtype, device="cuda"
-            )
+            x = torch.randn(*shape, dtype=dtype, device="cuda")
+            w = torch.randn(*normalized_shape, dtype=dtype, device="cuda")
             grad_out = torch.randn(*shape, dtype=dtype, device="cuda")
 
             # quack override active
             x1 = x.detach().requires_grad_(True)
             w1 = w.detach().requires_grad_(True)
-            y, _ = torch.ops.aten._fused_rms_norm(
-                x1, normalized_shape, w1, self.EPS
-            )
+            y, _ = torch.ops.aten._fused_rms_norm(x1, normalized_shape, w1, self.EPS)
             y.backward(grad_out)
 
             # ATen fallback
