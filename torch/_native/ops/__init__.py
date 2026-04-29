@@ -1,1 +1,1 @@
-from . import bmm_outer_product, groupnorm, norm
+from . import batchnorm, bmm_outer_product, groupnorm, norm
