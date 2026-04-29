@@ -168,6 +168,128 @@ class BatchNormFwd(_BatchNormBase):
             mO[n, c, s] = y.to(mO.element_type)
 
 
+class BatchNormStats(_BatchNormBase):
+    @cute.jit
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mRunningMean: cute.Tensor | None,
+        mRunningVar: cute.Tensor | None,
+        mMean: cute.Tensor,
+        mInvstd: cute.Tensor,
+        momentum: Float32,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mX, mRunningMean, mRunningVar, mMean, mInvstd, momentum, eps
+        ).launch(
+            grid=[mX.shape[1], 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mX: cute.Tensor,
+        mRunningMean: cute.Tensor | None,
+        mRunningVar: cute.Tensor | None,
+        mMean: cute.Tensor,
+        mInvstd: cute.Tensor,
+        momentum: Float32,
+        eps: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        c, _, _ = cute.arch.block_idx()
+        R = mX.shape[0] * self.S
+
+        smem = cutlass.utils.SmemAllocator()
+        acc_sum = smem.allocate_tensor(Float32, self.num_warps + 1)
+        acc_sumsq = smem.allocate_tensor(Float32, self.num_warps + 1)
+
+        sum_x = Float32(0.0)
+        sum_x_sq = Float32(0.0)
+        for r in cutlass.range(tidx, R, self.num_threads):
+            n, s = self._offset_to_ns(r)
+            x = mX[n, c, s].to(Float32)
+            sum_x += x
+            sum_x_sq += x * x
+
+        sum_x = self._cta_reduce_sum(sum_x, acc_sum)
+        sum_x_sq = self._cta_reduce_sum(sum_x_sq, acc_sumsq)
+
+        if tidx == 0:
+            mean = sum_x / R
+            var = sum_x_sq / R - mean * mean
+            var = cute.arch.fmax(var, Float32(0.0))
+            invstd = cute.math.rsqrt(var + eps, fastmath=True)
+            mMean[c] = mean
+            mInvstd[c] = invstd
+            if const_expr(mRunningMean is not None):
+                old_mean = mRunningMean[c].to(Float32)
+                mRunningMean[c] = (
+                    old_mean * (Float32(1.0) - momentum) + mean * momentum
+                ).to(mRunningMean.element_type)
+            if const_expr(mRunningVar is not None):
+                old_var = mRunningVar[c].to(Float32)
+                unbiased_var = var * R / (R - 1)
+                mRunningVar[c] = (
+                    old_var * (Float32(1.0) - momentum) + unbiased_var * momentum
+                ).to(mRunningVar.element_type)
+
+
+class BatchNormApply(_BatchNormBase):
+    @cute.jit
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor | None,
+        mB: cute.Tensor | None,
+        mO: cute.Tensor,
+        mMean: cute.Tensor,
+        mInvstd: cute.Tensor,
+        stream: cuda.CUstream,
+    ):
+        R = mX.shape[0] * self.S
+        self.kernel(mX, mW, mB, mO, mMean, mInvstd).launch(
+            grid=[mX.shape[1], cute.ceil_div(R, self.num_threads), 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor | None,
+        mB: cute.Tensor | None,
+        mO: cute.Tensor,
+        mMean: cute.Tensor,
+        mInvstd: cute.Tensor,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        c, rbidx, _ = cute.arch.block_idx()
+        _, grid_y, _ = cute.arch.grid_dim()
+        R = mX.shape[0] * self.S
+
+        mean = mMean[c]
+        invstd = mInvstd[c]
+        gamma = Float32(1.0)
+        beta = Float32(0.0)
+        if const_expr(mW is not None):
+            gamma = mW[c].to(Float32)
+        if const_expr(mB is not None):
+            beta = mB[c].to(Float32)
+
+        start = rbidx * self.num_threads + tidx
+        stride = grid_y * self.num_threads
+        for r in cutlass.range(start, R, stride):
+            n, s = self._offset_to_ns(r)
+            y = (mX[n, c, s].to(Float32) - mean) * invstd * gamma + beta
+            mO[n, c, s] = y.to(mO.element_type)
+
+
 class BatchNormEval(_BatchNormBase):
     @cute.jit
     def __call__(
@@ -222,6 +344,69 @@ class BatchNormEval(_BatchNormBase):
             beta = mB[c].to(Float32)
 
         for r in cutlass.range(tidx, R, self.num_threads):
+            n, s = self._offset_to_ns(r)
+            y = (mX[n, c, s].to(Float32) - mean) * invstd * gamma + beta
+            mO[n, c, s] = y.to(mO.element_type)
+
+
+class BatchNormEvalApply(_BatchNormBase):
+    @cute.jit
+    def __call__(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor | None,
+        mB: cute.Tensor | None,
+        mRunningMean: cute.Tensor,
+        mRunningVar: cute.Tensor,
+        mO: cute.Tensor,
+        mMean: cute.Tensor,
+        mInvstd: cute.Tensor,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        R = mX.shape[0] * self.S
+        self.kernel(
+            mX, mW, mB, mRunningMean, mRunningVar, mO, mMean, mInvstd, eps
+        ).launch(
+            grid=[mX.shape[1], cute.ceil_div(R, self.num_threads), 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mX: cute.Tensor,
+        mW: cute.Tensor | None,
+        mB: cute.Tensor | None,
+        mRunningMean: cute.Tensor,
+        mRunningVar: cute.Tensor,
+        mO: cute.Tensor,
+        mMean: cute.Tensor,
+        mInvstd: cute.Tensor,
+        eps: Float32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        c, rbidx, _ = cute.arch.block_idx()
+        _, grid_y, _ = cute.arch.grid_dim()
+        R = mX.shape[0] * self.S
+
+        mean = mRunningMean[c].to(Float32)
+        invstd = cute.math.rsqrt(mRunningVar[c].to(Float32) + eps, fastmath=True)
+        if rbidx == 0 and tidx == 0:
+            mMean[c] = mean
+            mInvstd[c] = invstd
+
+        gamma = Float32(1.0)
+        beta = Float32(0.0)
+        if const_expr(mW is not None):
+            gamma = mW[c].to(Float32)
+        if const_expr(mB is not None):
+            beta = mB[c].to(Float32)
+
+        start = rbidx * self.num_threads + tidx
+        stride = grid_y * self.num_threads
+        for r in cutlass.range(start, R, stride):
             n, s = self._offset_to_ns(r)
             y = (mX[n, c, s].to(Float32) - mean) * invstd * gamma + beta
             mO[n, c, s] = y.to(mO.element_type)
@@ -312,6 +497,104 @@ def _num_threads_for_spatial(S: int) -> int:
     return 512 if S >= 64 else 256
 
 
+def _use_split_eval_apply(x: Tensor, S: int) -> bool:
+    return x.size(0) * S >= 96 * 1024
+
+
+def _use_split_train_apply(x: Tensor, S: int) -> bool:
+    return x.size(0) * S >= 96 * 1024
+
+
+def _batchnorm_stats(
+    x: Tensor,
+    running_mean: Tensor | None,
+    running_var: Tensor | None,
+    mean: Tensor,
+    invstd: Tensor,
+    momentum: float,
+    eps: float,
+) -> None:
+    C, S = _shape_key(x)
+    dtype = _TORCH2CUTE_DTYPE[x.dtype]
+    running_mean_dtype = (
+        _TORCH2CUTE_DTYPE[running_mean.dtype] if running_mean is not None else None
+    )
+    running_var_dtype = (
+        _TORCH2CUTE_DTYPE[running_var.dtype] if running_var is not None else None
+    )
+    compile_key = (dtype, running_mean_dtype, running_var_dtype, C, S)
+    if compile_key not in _batchnorm_stats.compile_cache:
+        batch_sym = cute.sym_int()
+        x_cute = fake_tensor(dtype, (batch_sym, C, S))
+        running_mean_cute = (
+            fake_tensor(running_mean_dtype, (C,)) if running_mean_dtype else None
+        )
+        running_var_cute = (
+            fake_tensor(running_var_dtype, (C,)) if running_var_dtype else None
+        )
+        mean_cute = fake_tensor(Float32, (C,))
+        invstd_cute = fake_tensor(Float32, (C,))
+        _batchnorm_stats.compile_cache[compile_key] = cute.compile(
+            BatchNormStats(S, _num_threads_for_spatial(S)),
+            x_cute,
+            running_mean_cute,
+            running_var_cute,
+            mean_cute,
+            invstd_cute,
+            Float32(0),
+            Float32(0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    _batchnorm_stats.compile_cache[compile_key](
+        x, running_mean, running_var, mean, invstd, momentum, eps,
+    )
+
+
+_batchnorm_stats.compile_cache = {}
+
+
+def _batchnorm_apply(
+    x: Tensor,
+    weight: Tensor | None,
+    bias: Tensor | None,
+    out: Tensor,
+    mean: Tensor,
+    invstd: Tensor,
+) -> None:
+    C, S = _shape_key(x)
+    dtype = _TORCH2CUTE_DTYPE[x.dtype]
+    out_dtype = _TORCH2CUTE_DTYPE[out.dtype]
+    weight_dtype = _TORCH2CUTE_DTYPE[weight.dtype] if weight is not None else None
+    bias_dtype = _TORCH2CUTE_DTYPE[bias.dtype] if bias is not None else None
+    compile_key = (dtype, out_dtype, weight_dtype, bias_dtype, C, S)
+    if compile_key not in _batchnorm_apply.compile_cache:
+        batch_sym = cute.sym_int()
+        x_cute = fake_tensor(dtype, (batch_sym, C, S))
+        out_cute = fake_tensor(out_dtype, (batch_sym, C, S))
+        weight_cute = fake_tensor(weight_dtype, (C,)) if weight_dtype else None
+        bias_cute = fake_tensor(bias_dtype, (C,)) if bias_dtype else None
+        mean_cute = fake_tensor(Float32, (C,))
+        invstd_cute = fake_tensor(Float32, (C,))
+        _batchnorm_apply.compile_cache[compile_key] = cute.compile(
+            BatchNormApply(S, _num_threads_for_spatial(S)),
+            x_cute,
+            weight_cute,
+            bias_cute,
+            out_cute,
+            mean_cute,
+            invstd_cute,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    _batchnorm_apply.compile_cache[compile_key](
+        x, weight, bias, out, mean, invstd,
+    )
+
+
+_batchnorm_apply.compile_cache = {}
+
+
 def _batchnorm_fwd(
     x: Tensor,
     weight: Tensor | None,
@@ -325,6 +608,13 @@ def _batchnorm_fwd(
     eps: float,
 ) -> None:
     C, S = _shape_key(x)
+    if _use_split_train_apply(x, S):
+        _batchnorm_stats(
+            x, running_mean, running_var, mean, invstd, momentum, eps,
+        )
+        _batchnorm_apply(x, weight, bias, out, mean, invstd)
+        return
+
     dtype = _TORCH2CUTE_DTYPE[x.dtype]
     out_dtype = _TORCH2CUTE_DTYPE[out.dtype]
     weight_dtype = _TORCH2CUTE_DTYPE[weight.dtype] if weight is not None else None
@@ -391,6 +681,66 @@ def _batchnorm_fwd(
 _batchnorm_fwd.compile_cache = {}
 
 
+def _batchnorm_eval_apply(
+    x: Tensor,
+    weight: Tensor | None,
+    bias: Tensor | None,
+    running_mean: Tensor,
+    running_var: Tensor,
+    out: Tensor,
+    mean: Tensor,
+    invstd: Tensor,
+    eps: float,
+) -> None:
+    C, S = _shape_key(x)
+    dtype = _TORCH2CUTE_DTYPE[x.dtype]
+    out_dtype = _TORCH2CUTE_DTYPE[out.dtype]
+    weight_dtype = _TORCH2CUTE_DTYPE[weight.dtype] if weight is not None else None
+    bias_dtype = _TORCH2CUTE_DTYPE[bias.dtype] if bias is not None else None
+    running_mean_dtype = _TORCH2CUTE_DTYPE[running_mean.dtype]
+    running_var_dtype = _TORCH2CUTE_DTYPE[running_var.dtype]
+    compile_key = (
+        dtype,
+        out_dtype,
+        weight_dtype,
+        bias_dtype,
+        running_mean_dtype,
+        running_var_dtype,
+        C,
+        S,
+    )
+    if compile_key not in _batchnorm_eval_apply.compile_cache:
+        batch_sym = cute.sym_int()
+        x_cute = fake_tensor(dtype, (batch_sym, C, S))
+        out_cute = fake_tensor(out_dtype, (batch_sym, C, S))
+        weight_cute = fake_tensor(weight_dtype, (C,)) if weight_dtype else None
+        bias_cute = fake_tensor(bias_dtype, (C,)) if bias_dtype else None
+        running_mean_cute = fake_tensor(running_mean_dtype, (C,))
+        running_var_cute = fake_tensor(running_var_dtype, (C,))
+        mean_cute = fake_tensor(Float32, (C,))
+        invstd_cute = fake_tensor(Float32, (C,))
+        _batchnorm_eval_apply.compile_cache[compile_key] = cute.compile(
+            BatchNormEvalApply(S, _num_threads_for_spatial(S)),
+            x_cute,
+            weight_cute,
+            bias_cute,
+            running_mean_cute,
+            running_var_cute,
+            out_cute,
+            mean_cute,
+            invstd_cute,
+            Float32(0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    _batchnorm_eval_apply.compile_cache[compile_key](
+        x, weight, bias, running_mean, running_var, out, mean, invstd, eps,
+    )
+
+
+_batchnorm_eval_apply.compile_cache = {}
+
+
 def _batchnorm_eval(
     x: Tensor,
     weight: Tensor | None,
@@ -403,6 +753,12 @@ def _batchnorm_eval(
     eps: float,
 ) -> None:
     C, S = _shape_key(x)
+    if _use_split_eval_apply(x, S):
+        _batchnorm_eval_apply(
+            x, weight, bias, running_mean, running_var, out, mean, invstd, eps,
+        )
+        return
+
     dtype = _TORCH2CUTE_DTYPE[x.dtype]
     out_dtype = _TORCH2CUTE_DTYPE[out.dtype]
     weight_dtype = _TORCH2CUTE_DTYPE[weight.dtype] if weight is not None else None
