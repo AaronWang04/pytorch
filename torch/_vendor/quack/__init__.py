@@ -2,7 +2,7 @@
 
 Upstream SHA: 6bceaad2dba3b979b898824b146b1bb2816fc483 (quack 0.4.0)
 
-Only the modules required by torch._native.ops.norm.rmsnorm_impl are vendored.
+Only the modules required by torch._native CuTeDSL norm overrides are vendored.
 Imports are rewritten to be package-relative so this copy is independent of any
 ``quack`` top-level package that may be installed via pip. Custom op namespaces
 are renamed from ``quack::`` to ``torch_vendor_quack::`` for the same reason.
